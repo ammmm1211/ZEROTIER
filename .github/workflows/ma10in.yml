@@ -1,0 +1,303 @@
+name: ZeroTier-RDP-Fixed
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_region:
+        description: 'Select deployment region'
+        required: false
+        default: 'default'
+
+jobs:
+  zt-remote-access:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: enable-and-configure-rdp
+        run: |
+          Write-Host "تهيئة RDP بشكل كامل..."
+          
+          # تفعيل RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+          
+          # إعداد NLA (Network Level Authentication) - مهم للاتصال الآمن
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 1 -Force
+          
+          # إعدادات إضافية لتحسين الاتصال
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fSingleSessionPerUser" -Value 0 -Force
+          
+          # جدار الحماية
+          netsh advfirewall firewall delete rule name="RemoteDesktop" 2>$null
+          netsh advfirewall firewall delete rule name="ZeroTier-RDP" 2>$null
+          
+          netsh advfirewall firewall add rule name="RemoteDesktop-TCP" `
+            dir=in action=allow protocol=TCP localport=3389 `
+            description="Allow RDP TCP"
+            
+          netsh advfirewall firewall add rule name="RemoteDesktop-UDP" `
+            dir=in action=allow protocol=UDP localport=3389 `
+            description="Allow RDP UDP"
+          
+          # إعادة الخدمات
+          Restart-Service TermService -Force
+          Start-Service SessionEnv -ErrorAction SilentlyContinue
+          
+          Write-Host "تم إعداد RDP بالكامل ✓"
+
+      - name: create-secure-user
+        run: |
+          # إنشاء مستخدم جديد أكثر أماناً
+          $username = "RemoteUser"
+          $password = "P@ssw0rd!2024"
+          
+          # حذف المستخدم إذا موجود
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($existing) {
+              Remove-LocalUser -Name $username -Confirm:$false
+          }
+          
+          # إنشاء المستخدم
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePass `
+                       -FullName "Remote Access User" `
+                       -Description "For remote desktop connections" `
+                       -AccountNeverExpires
+          
+          # إضافة للمجموعات
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          
+          # إعداد حساب للاتصال التلقائي
+          Set-LocalUser -Name $username -PasswordNeverExpires $true
+          
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "تم إنشاء المستخدم: $username"
+
+      - name: install-zerotier-enhanced
+        run: |
+          Write-Host "تثبيت ZeroTier مع إعدادات محسنة..."
+          
+          # إزالة أي نسخة قديمة
+          Get-Service -Name "ZeroTier OneService" -ErrorAction SilentlyContinue | Stop-Service -Force
+          
+          # تحميل ZeroTier
+          $zt_url = "https://download.zerotier.com/dist/ZeroTier%20One.msi"
+          $zt_path = "$env:TEMP\ZeroTier.msi"
+          
+          Invoke-WebRequest -Uri $zt_url -OutFile $zt_path -UseBasicParsing
+          
+          # التثبيت مع خيارات كاملة
+          Start-Process msiexec.exe -ArgumentList @(
+            "/i",
+            "`"$zt_path`"",
+            "/quiet",
+            "/norestart",
+            "ADDLOCAL=ZTApi,ZTCli,ZTService,ZTUi"
+          ) -Wait -NoNewWindow
+          
+          Remove-Item $zt_path -Force
+          
+          # بدء الخدمة
+          Start-Service -Name "ZeroTier OneService" -ErrorAction SilentlyContinue
+          Set-Service -Name "ZeroTier OneService" -StartupType Automatic
+          
+          Write-Host "تم تثبيت ZeroTier ✓"
+
+      - name: configure-zerotier-network
+        run: |
+          Write-Host "إعداد شبكة ZeroTier..."
+          
+          $zt_cli = "C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat"
+          $network_id = "${{ secrets.ZEROTIER_NETWORK_ID }}"
+          
+          if (-not $network_id -or $network_id -eq "") {
+              Write-Error "❗ لم يتم تعيين ZEROTIER_NETWORK_ID في Secrets"
+              exit 1
+          }
+          
+          Write-Host "Network ID: $network_id"
+          
+          # الانضمام للشبكة
+          & $zt_cli join $network_id
+          Start-Sleep -Seconds 3
+          
+          # الحصول على معرف الجهاز
+          $device_info = & $zt_cli info
+          $device_id = ($device_info | Select-String "info").Line.Split()[2]
+          
+          echo "ZT_DEVICE_ID=$device_id" >> $env:GITHUB_ENV
+          Write-Host "Device ID: $device_id"
+          
+          # انتظار الاتصال
+          Write-Host "جاري الاتصال بالشبكة..."
+          $connected = $false
+          $attempts = 0
+          
+          while (-not $connected -and $attempts -lt 30) {
+              $status = & $zt_cli listnetworks
+              
+              if ($status -match "OK") {
+                  $lines = $status -split "`n"
+                  foreach ($line in $lines) {
+                      if ($line -match "$network_id.*?(\d+\.\d+\.\d+\.\d+)/\d+") {
+                          $ip = $matches[1]
+                          echo "ZT_IP=$ip" >> $env:GITHUB_ENV
+                          Write-Host "✅ حصل على IP: $ip"
+                          $connected = $true
+                          break
+                      }
+                  }
+              }
+              
+              if (-not $connected) {
+                  $attempts++
+                  Write-Host "⏳ محاولة $attempts/30 - في انتظار الموافقة..."
+                  Start-Sleep -Seconds 5
+              }
+          }
+          
+          if (-not $connected) {
+              Write-Host "⚠️  لم يحصل على IP بعد"
+              Write-Host "🔗 الرجاء الموافقة على الجهاز هنا:"
+              Write-Host "https://my.zerotier.com/network/$network_id"
+              Write-Host "🔑 Device ID: $device_id"
+          }
+
+      - name: test-rdp-connection
+        run: |
+          Write-Host "اختبار اتصال RDP..."
+          
+          # إنشاء ملف اختبار اتصال
+          $test_script = @"
+@echo off
+echo اختبار اتصال RDP
+echo =================
+echo.
+echo 1. تحقق من خدمة RDP
+sc query TermService
+echo.
+echo 2. تحقق من منفذ 3389
+netstat -an | findstr :3389
+echo.
+echo 3. إعدادات المستخدم
+net user $env:RDP_USER
+echo.
+echo 4. عنوان ZeroTier
+"@
+          
+          $test_script | Out-File -FilePath "C:\RDP_Test.txt" -Encoding ASCII
+          
+          if ($env:ZT_IP) {
+              "echo ZeroTier IP: $env:ZT_IP" | Out-File -FilePath "C:\RDP_Test.txt" -Append -Encoding ASCII
+          } else {
+              "echo ZeroTier IP: في انتظار الموافقة" | Out-File -FilePath "C:\RDP_Test.txt" -Append -Encoding ASCII
+          }
+          
+          Write-Host "تم إنشاء ملف اختبار في C:\RDP_Test.txt"
+
+      - name: install-remote-tools
+        run: |
+          Write-Host "تثبيت أدوات مساعدة..."
+          
+          $desktop = "C:\Users\Public\Desktop"
+          
+          # 1. AnyDesk (بديل لـ RustDesk)
+          $anydesk_url = "https://download.anydesk.com/AnyDesk.exe"
+          $anydesk_path = "$desktop\AnyDesk.exe"
+          Invoke-WebRequest -Uri $anydesk_url -OutFile $anydesk_path -UseBasicParsing
+          
+          # 2. إنشاء ملف إرشادات
+          $guide = @"
+# إرشادات الاتصال
+==================
+
+## 1. اتصال ZeroTier:
+- سجل الدخول: https://my.zerotier.com
+- الشبكة: ${{ secrets.ZEROTIER_NETWORK_ID }}
+- الجهاز: $env:ZT_DEVICE_ID
+- ضع ✓ على الجهاز ثم انتظر 30 ثانية
+
+## 2. بيانات الاتصال:
+- العنوان: $env:ZT_IP
+- المستخدم: $env:RDP_USER
+- كلمة المرور: $env:RDP_PASS
+
+## 3. إذا فشل RDP:
+- افتح AnyDesk.exe على سطح المكتب
+- استخدم رقم AnyDesk للاتصال
+
+## 4. استكشاف الأخطاء:
+- افتح C:\RDP_Test.txt للمعلومات
+"@
+          
+          $guide | Out-File -FilePath "$desktop\ReadMe_Connection.txt" -Encoding UTF8
+          
+          Write-Host "تم تثبيت الأدوات المساعدة ✓"
+
+      - name: final-status-check
+        run: |
+          Write-Host ""
+          Write-Host "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄"
+          Write-Host "🚀  إعداد RDP عبر ZeroTier مكتمل"
+          Write-Host "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"
+          Write-Host ""
+          
+          if ($env:ZT_IP) {
+              Write-Host "✅  العنوان النهائي: $env:ZT_IP"
+              Write-Host "👤  المستخدم: $env:RDP_USER"
+              Write-Host "🔑  كلمة المرور: $env:RDP_PASS"
+              Write-Host ""
+              Write-Host "📡  يمكنك الاتصال الآن عبر Remote Desktop"
+          } else {
+              Write-Host "⚠️  في انتظار الموافقة على الجهاز"
+              Write-Host ""
+              Write-Host "🔗  اذهب إلى: https://my.zerotier.com"
+              Write-Host "📋  Network ID: ${{ secrets.ZEROTIER_NETWORK_ID }}"
+              Write-Host "🆔  Device ID: $env:ZT_DEVICE_ID"
+              Write-Host ""
+              Write-Host "1. سجل الدخول إلى ZeroTier"
+              Write-Host "2. اختر شبكتك"
+              Write-Host "3. ابحث عن الجهاز: $env:ZT_DEVICE_ID"
+              Write-Host "4. ضع ✓ في عمود Auth"
+              Write-Host "5. انتظر 30 ثانية"
+              Write-Host "6. أعد تشغيل الـ Workflow"
+          }
+          
+          Write-Host ""
+          Write-Host "⏳  الجلسة ستبقى نشطة لمدة 6 ساعات"
+          
+          # عرض تحديث دوري
+          $hours = 6
+          $startTime = Get-Date
+          
+          for ($i = 1; $i -le ($hours * 12); $i++) {
+              $elapsed = (Get-Date) - $startTime
+              $remaining = New-TimeSpan -Minutes ($hours * 60) - $elapsed
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏱️  متبقي: $($remaining.ToString('hh\:mm'))"
+              
+              # تحديث حالة ZeroTier كل 5 دقائق
+              if ($i % 5 -eq 0 -and -not $env:ZT_IP) {
+                  $zt_cli = "C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat"
+                  $status = & $zt_cli listnetworks 2>$null
+                  if ($status -match "(\d+\.\d+\.\d+\.\d+)") {
+                      $new_ip = $matches[1]
+                      Write-Host "🎉  تم الحصول على IP جديد: $new_ip"
+                      echo "ZT_IP=$new_ip" >> $env:GITHUB_ENV
+                  }
+              }
+              
+              Start-Sleep -Seconds 300  # 5 دقائق
+          }
+          
+          Write-Host "⏰  انتهت مدة الجلسة"
